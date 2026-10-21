@@ -1,165 +1,305 @@
 --[[
-    BRIDGE BATTLES — SMART BOT (TEAM DETECTION)
-    Fitur: Auto Take (Sesuai Tim), Auto Path, Auto Place, Auto Shoot
-    Status: No-Crash, Mobile/Emulator Friendly
+    BRIDGE BATTLES — SMART BOT v2
+    Fitur  : Auto Take (Team-Aware), Auto Path, Auto Place, Auto Shoot
+    Fix    : Heartbeat-safe timers, deep workspace scan, MoveTo goal-check,
+             shoot throttle, connection cleanup on reload
+    Target : Bridge Battles (Roblox) — Mobile/Emulator Friendly
 ]]
 
+-- ── Cleanup instance lama ────────────────────────────────────────────────────
 if _G.BridgeBotLoaded then
     pcall(function() _G.BridgeBotLoaded:Destroy() end)
 end
+if _G.BridgeBotConnections then
+    for _, c in ipairs(_G.BridgeBotConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+end
+_G.BridgeBotConnections = {}
 
-local Players = game:GetService("Players")
-local Workspace = game:GetService("Workspace")
+-- ── Services ─────────────────────────────────────────────────────────────────
+local Players    = game:GetService("Players")
+local Workspace  = game:GetService("Workspace")
 local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
-local Mouse = LocalPlayer:GetMouse()
 
+local LocalPlayer = Players.LocalPlayer
+
+-- ── Config ───────────────────────────────────────────────────────────────────
 local Config = {
-    AutoPlay = false,   -- Ini ngegabungin Take, Path, dan Place
-    AutoShoot = false,
-    WalkSpeed = 20,     -- Kecepatan jalan (aman dari anti-cheat)
+    AutoPlay    = false,   -- Take → Path → Place
+    AutoShoot   = false,   -- Spam-activate equipped tool
+    WalkSpeed   = 20,      -- Jaga di bawah 22 (aman)
+    PlaceRate   = 0.18,    -- Detik antar place (lebih kecil = lebih cepet build)
+    ShootRate   = 0.25,    -- Detik antar shoot
+    ReachDist   = 4,       -- Jarak anggap "udah nyampe" tujuan (studs)
+    SearchDepth = 6,       -- Kedalaman rekursi workspace scan
 }
 
-local function getTool()
-    local char = LocalPlayer.Character
-    return char and char:FindFirstChildOfClass("Tool")
+-- ── State ─────────────────────────────────────────────────────────────────────
+local State = {
+    lastPlace = 0,
+    lastShoot = 0,
+    moveTarget = nil,   -- Vector3 tujuan MoveTo saat ini
+}
+
+-- ── Helpers ───────────────────────────────────────────────────────────────────
+local function getChar()
+    local c = LocalPlayer.Character
+    if not c then return nil, nil, nil end
+    return c, c:FindFirstChild("Humanoid"), c:FindFirstChild("HumanoidRootPart")
 end
 
--- Cari blok di tanah sesuai warna tim lo
-local function getNearestTeamBlock()
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp or not LocalPlayer.Team then return nil end
-    
-    local nearest = nil
-    local shortest = 100 -- Jarak maksimal nyari blok
-    
-    for _, obj in ipairs(Workspace:GetChildren()) do
+local function getTool()
+    local c = LocalPlayer.Character
+    return c and c:FindFirstChildOfClass("Tool")
+end
+
+-- Deep scan workspace dengan batasan kedalaman — cegah stack overflow
+local function scanDescendants(root, depth, results)
+    if depth <= 0 then return end
+    for _, obj in ipairs(root:GetChildren()) do
         if obj:IsA("BasePart") then
-            -- Cek apakah warnanya sama dengan tim, ATAU namanya mengandung nama tim
-            local isTeamBlock = (obj.Color == LocalPlayer.TeamColor.Color) or 
-                                (string.find(string.lower(obj.Name), string.lower(LocalPlayer.Team.Name), 1, true))
-            
-            -- Cek apakah ini blok (namanya ada tulisan "block" atau "stud")
-            local isBlock = string.find(string.lower(obj.Name), "block", 1, true) or 
-                            string.find(string.lower(obj.Name), "stud", 1, true)
-            
-            if isTeamBlock and isBlock then
-                local dist = (obj.Position - hrp.Position).Magnitude
-                if dist < shortest then
-                    shortest = dist
-                    nearest = obj
-                end
+            results[#results + 1] = obj
+        end
+        -- Masuk ke Model/Folder, tapi skip character player lain
+        if (obj:IsA("Model") or obj:IsA("Folder")) and not Players:GetPlayerFromCharacter(obj) then
+            scanDescendants(obj, depth - 1, results)
+        end
+    end
+end
+
+-- Cari blok tim terdekat (warna ATAU nama tim)
+local function getNearestTeamBlock()
+    local _, _, hrp = getChar()
+    if not hrp or not LocalPlayer.Team then return nil end
+
+    local teamColor = LocalPlayer.TeamColor.Color
+    local teamName  = string.lower(LocalPlayer.Team.Name)
+
+    local parts = {}
+    scanDescendants(Workspace, Config.SearchDepth, parts)
+
+    local nearest, shortest = nil, 120
+    for _, obj in ipairs(parts) do
+        local nameLow = string.lower(obj.Name)
+        local isTeamColored = (obj.Color == teamColor)
+        local isTeamNamed   = string.find(nameLow, teamName, 1, true)
+        local isBlockPart   = string.find(nameLow, "block", 1, true)
+                           or string.find(nameLow, "stud",  1, true)
+                           or string.find(nameLow, "brick", 1, true)
+
+        if (isTeamColored or isTeamNamed) and isBlockPart then
+            local dist = (obj.Position - hrp.Position).Magnitude
+            if dist < shortest then
+                shortest = dist
+                nearest  = obj
             end
         end
     end
     return nearest
 end
 
--- Simulasi klik (Cocok buat CloudEmulator)
+-- Safe MoveTo: hanya kirim perintah baru kalau target berubah / belum nyampe
+local function moveTo(hum, hrp, target)
+    if not (hum and hrp and target) then return end
+    local dist = (hrp.Position - target).Magnitude
+    if dist <= Config.ReachDist then
+        State.moveTarget = nil
+        return true -- udah nyampe
+    end
+    -- Kirim MoveTo baru hanya kalau target beda dari yg terakhir
+    if State.moveTarget == nil or (State.moveTarget - target).Magnitude > 1 then
+        State.moveTarget = target
+        hum:MoveTo(target)
+    end
+    return false
+end
+
+-- Place throttled
 local function doPlace()
+    local now = tick()
+    if now - State.lastPlace < Config.PlaceRate then return end
     local tool = getTool()
     if tool then
         pcall(function() tool:Activate() end)
+        State.lastPlace = now
     end
 end
 
--- Loop Utama
-RunService.Heartbeat:Connect(function()
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChild("Humanoid")
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    
-    if not (char and hum and hrp) then return end
-    hum.WalkSpeed = Config.WalkSpeed
+-- Shoot throttled
+local function doShoot()
+    local now = tick()
+    if now - State.lastShoot < Config.ShootRate then return end
+    local tool = getTool()
+    if tool then
+        pcall(function() tool:Activate() end)
+        State.lastShoot = now
+    end
+end
 
-    -- FITUR AUTO SHOOT
-    if Config.AutoShoot then
-        doPlace() -- Di game ini biasanya tool sword/pistol diaktifin pakai klik
-        task.wait(0.2)
+-- ── Loop Utama (Heartbeat-safe: TANPA task.wait di dalam) ─────────────────────
+local conn = RunService.Heartbeat:Connect(function()
+    local char, hum, hrp = getChar()
+    if not (char and hum and hrp) then return end
+
+    -- Jaga WalkSpeed
+    if hum.WalkSpeed ~= Config.WalkSpeed then
+        hum.WalkSpeed = Config.WalkSpeed
     end
 
-    -- FITUR AUTO PLAY (Take -> Walk -> Place)
+    -- AUTO SHOOT
+    if Config.AutoShoot then
+        doShoot()
+    end
+
+    -- AUTO PLAY
     if Config.AutoPlay then
-        local equippedTool = getTool()
-        
-        if equippedTool then
-            -- LOGIKA 1: KALAU UDAH MEGANG BLOK, JALAN LURUS KE DEPAN
-            local forwardPos = hrp.Position + (hrp.CFrame.LookVector * 15)
-            hum:MoveTo(forwardPos)
-            
-            -- Sambil jalan, klik terus buat naruh blok kalau udah mentok ujung
-            doPlace() 
+        local tool = getTool()
+
+        if tool then
+            -- Punya blok → jalan lurus ke depan sambil place
+            local forwardTarget = hrp.Position + hrp.CFrame.LookVector * 12
+            -- Matikan Y drift biar ngga jatuh kalau ada slope kecil
+            forwardTarget = Vector3.new(forwardTarget.X, hrp.Position.Y, forwardTarget.Z)
+            moveTo(hum, hrp, forwardTarget)
+            doPlace()
         else
-            -- LOGIKA 2: KALAU TANGAN KOSONG, CARI BLOK TIM LO
+            -- Tangan kosong → cari blok tim
             local block = getNearestTeamBlock()
             if block then
-                hum:MoveTo(block.Position)
-                -- Kalau udah deket banget, pasti otomatis ke-ambil sama game-nya
+                local arrived = moveTo(hum, hrp, block.Position)
+                -- Kalau udah sampai tapi blok masih ada, tap buat ambil
+                if arrived then
+                    pcall(function()
+                        -- Simulasi touch/interact — beberapa game pake ProximityPrompt
+                        local pp = block:FindFirstChildOfClass("ProximityPrompt")
+                        if pp then
+                            fireproximityprompt(pp)  -- executor global func
+                        end
+                    end)
+                end
             else
-                -- Kalau blok ngga keliatan, jalan muter dikit nyari
-                hum:MoveTo(hrp.Position + Vector3.new(math.random(-10,10), 0, math.random(-10,10)))
+                -- Blok ngga ketemu → wander pelan ke titik random deket spawn
+                local wander = hrp.Position + Vector3.new(
+                    math.random(-8, 8), 0, math.random(-8, 8)
+                )
+                moveTo(hum, hrp, wander)
             end
         end
-        task.wait(0.3)
     end
 end)
 
--- ================= GUI =================
+_G.BridgeBotConnections[#_G.BridgeBotConnections + 1] = conn
+
+-- ── GUI ───────────────────────────────────────────────────────────────────────
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name = "BridgeBotGUI"
-ScreenGui.ResetOnSpawn = false
-ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+ScreenGui.Name          = "BridgeBotGUI"
+ScreenGui.ResetOnSpawn  = false
+ScreenGui.Parent        = LocalPlayer:WaitForChild("PlayerGui")
 
-local MainFrame = Instance.new("Frame")
-MainFrame.Size = UDim2.new(0, 200, 0, 180)
-MainFrame.Position = UDim2.new(0, 20, 0.5, -90)
-MainFrame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
-MainFrame.BorderSizePixel = 0
-MainFrame.Active = true
-MainFrame.Draggable = true
-MainFrame.Parent = ScreenGui
+local MainFrame = Instance.new("Frame", ScreenGui)
+MainFrame.Size              = UDim2.new(0, 210, 0, 200)
+MainFrame.Position          = UDim2.new(0, 16, 0.5, -100)
+MainFrame.BackgroundColor3  = Color3.fromRGB(15, 15, 15)
+MainFrame.BorderSizePixel   = 0
+MainFrame.Active            = true
+MainFrame.Draggable         = true
+Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
 
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 8)
+-- Title bar
+local TitleBar = Instance.new("Frame", MainFrame)
+TitleBar.Size             = UDim2.new(1, 0, 0, 38)
+TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+TitleBar.BorderSizePixel  = 0
+Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
 
-local Title = Instance.new("TextLabel", MainFrame)
-Title.Size = UDim2.new(1, 0, 0, 40)
+local Title = Instance.new("TextLabel", TitleBar)
+Title.Size                = UDim2.new(1, 0, 1, 0)
 Title.BackgroundTransparency = 1
-Title.Text = "Smart Bridge Bot"
-Title.TextColor3 = Color3.fromRGB(255, 255, 255)
-Title.Font = Enum.Font.GothamBold
-Title.TextSize = 16
+Title.Text                = "🌉 Bridge Bot v2"
+Title.TextColor3          = Color3.fromRGB(240, 240, 240)
+Title.Font                = Enum.Font.GothamBold
+Title.TextSize            = 15
 
-local function createToggle(name, key, y)
-    local Btn = Instance.new("TextButton", MainFrame)
-    Btn.Size = UDim2.new(0.9, 0, 0, 40)
-    Btn.Position = UDim2.new(0.05, 0, 0, y)
-    Btn.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
-    Btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    Btn.Font = Enum.Font.GothamBold
-    Btn.TextSize = 14
-    Btn.Text = name .. " : OFF"
-    
-    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 5)
+-- Toggle factory
+local function createToggle(parent, labelText, configKey, yPos)
+    local Btn = Instance.new("TextButton", parent)
+    Btn.Size             = UDim2.new(0.88, 0, 0, 38)
+    Btn.Position         = UDim2.new(0.06, 0, 0, yPos)
+    Btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
+    Btn.TextColor3       = Color3.fromRGB(220, 220, 220)
+    Btn.Font             = Enum.Font.GothamBold
+    Btn.TextSize         = 13
+    Btn.Text             = labelText .. "  ●  OFF"
+    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
 
     Btn.MouseButton1Click:Connect(function()
-        Config[key] = not Config[key]
-        Btn.Text = name .. " : " .. (Config[key] and "ON" or "OFF")
-        Btn.BackgroundColor3 = Config[key] and Color3.fromRGB(0, 150, 0) or Color3.fromRGB(45, 45, 45)
+        Config[configKey] = not Config[configKey]
+        local on = Config[configKey]
+        Btn.Text             = labelText .. "  ●  " .. (on and "ON" or "OFF")
+        Btn.BackgroundColor3 = on and Color3.fromRGB(20, 140, 60) or Color3.fromRGB(40, 40, 40)
     end)
+    return Btn
 end
 
-createToggle("Auto Play (Team)", "AutoPlay", 50)
-createToggle("Auto Shoot", "AutoShoot", 100)
+createToggle(MainFrame, "Auto Play (Team)", "AutoPlay",  46)
+createToggle(MainFrame, "Auto Shoot",       "AutoShoot", 92)
 
+-- Speed slider label (read-only display)
+local SpeedLabel = Instance.new("TextLabel", MainFrame)
+SpeedLabel.Size                 = UDim2.new(0.88, 0, 0, 24)
+SpeedLabel.Position             = UDim2.new(0.06, 0, 0, 138)
+SpeedLabel.BackgroundTransparency = 1
+SpeedLabel.Text                 = "Speed: " .. Config.WalkSpeed
+SpeedLabel.TextColor3           = Color3.fromRGB(160, 160, 160)
+SpeedLabel.Font                 = Enum.Font.Gotham
+SpeedLabel.TextSize             = 12
+SpeedLabel.TextXAlignment       = Enum.TextXAlignment.Left
+
+-- Speed +/- buttons
+local function makeSpeedBtn(label, xOffset, delta)
+    local Btn = Instance.new("TextButton", MainFrame)
+    Btn.Size             = UDim2.new(0, 36, 0, 24)
+    Btn.Position         = UDim2.new(0, xOffset, 0, 162)
+    Btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
+    Btn.TextColor3       = Color3.fromRGB(255, 255, 255)
+    Btn.Font             = Enum.Font.GothamBold
+    Btn.TextSize         = 14
+    Btn.Text             = label
+    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 5)
+    Btn.MouseButton1Click:Connect(function()
+        Config.WalkSpeed = math.clamp(Config.WalkSpeed + delta, 8, 40)
+        SpeedLabel.Text  = "Speed: " .. Config.WalkSpeed
+    end)
+end
+makeSpeedBtn("-", 14, -2)
+makeSpeedBtn("+", 56, 2)
+
+-- Status bar
 local Status = Instance.new("TextLabel", MainFrame)
-Status.Size = UDim2.new(1, 0, 0, 30)
-Status.Position = UDim2.new(0, 0, 1, -30)
+Status.Size                 = UDim2.new(1, 0, 0, 22)
+Status.Position             = UDim2.new(0, 0, 1, -24)
 Status.BackgroundTransparency = 1
-Status.Text = "Auto Detects Your Team"
-Status.TextColor3 = Color3.fromRGB(100, 200, 100)
-Status.Font = Enum.Font.Gotham
-Status.TextSize = 12
+Status.Text                 = "Auto Detects Team Color"
+Status.TextColor3           = Color3.fromRGB(80, 200, 120)
+Status.Font                 = Enum.Font.Gotham
+Status.TextSize             = 11
+
+-- Live team-color dot
+local dot = Instance.new("Frame", MainFrame)
+dot.Size             = UDim2.new(0, 10, 0, 10)
+dot.Position         = UDim2.new(1, -18, 1, -19)
+dot.BorderSizePixel  = 0
+Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+
+local dotConn = RunService.Heartbeat:Connect(function()
+    if LocalPlayer.Team then
+        dot.BackgroundColor3 = LocalPlayer.TeamColor.Color
+    else
+        dot.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
+    end
+end)
+_G.BridgeBotConnections[#_G.BridgeBotConnections + 1] = dotConn
 
 _G.BridgeBotLoaded = ScreenGui
-print("[BridgeBot] Smart Team Logic Loaded.")
+print("[BridgeBot v2] Loaded — Team auto-detected, connections tracked.")
