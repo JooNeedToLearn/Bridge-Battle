@@ -1,191 +1,289 @@
 --[[
-    BRIDGE BATTLES — SMART BOT v2
-    Fitur  : Auto Take (Team-Aware), Auto Path, Auto Place, Auto Shoot
-    Fix    : Heartbeat-safe timers, deep workspace scan, MoveTo goal-check,
-             shoot throttle, connection cleanup on reload
-    Target : Bridge Battles (Roblox) — Mobile/Emulator Friendly
+    BRIDGE BATTLES — SMART BOT v3
+    Fix v3:
+      - Hapus getNearestTeamBlock (blok dibeli currency, bukan pickup fisik)
+      - Auto-buy blok lewat RemoteEvent/UI saat blok habis
+      - Place pakai VirtualUser mouse click ke depan (posisi target nyata)
+      - Auto-orient ke ujung bridge (deteksi arah dari spawn)
+      - Heartbeat-safe, connection cleanup
+    Target : Bridge Battles (Roblox) — CloudEmulator / Mobile Friendly
 ]]
 
--- ── Cleanup instance lama ────────────────────────────────────────────────────
-if _G.BridgeBotLoaded then
-    pcall(function() _G.BridgeBotLoaded:Destroy() end)
-end
+-- ── Cleanup ───────────────────────────────────────────────────────────────────
+if _G.BridgeBotLoaded then pcall(function() _G.BridgeBotLoaded:Destroy() end) end
 if _G.BridgeBotConnections then
-    for _, c in ipairs(_G.BridgeBotConnections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(_G.BridgeBotConnections) do pcall(function() c:Disconnect() end) end
 end
 _G.BridgeBotConnections = {}
 
--- ── Services ─────────────────────────────────────────────────────────────────
-local Players    = game:GetService("Players")
-local Workspace  = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
+-- ── Services ──────────────────────────────────────────────────────────────────
+local Players       = game:GetService("Players")
+local RunService    = game:GetService("RunService")
+local UserInputSvc  = game:GetService("UserInputService")
+local VirtualUser   = game:GetService("VirtualUser")
+local TweenService  = game:GetService("TweenService")
+local Workspace     = game:GetService("Workspace")
+local Camera        = Workspace.CurrentCamera
 
-local LocalPlayer = Players.LocalPlayer
+local LP            = Players.LocalPlayer
+local Mouse         = LP:GetMouse()
 
--- ── Config ───────────────────────────────────────────────────────────────────
-local Config = {
-    AutoPlay    = false,   -- Take → Path → Place
-    AutoShoot   = false,   -- Spam-activate equipped tool
-    WalkSpeed   = 20,      -- Jaga di bawah 22 (aman)
-    PlaceRate   = 0.18,    -- Detik antar place (lebih kecil = lebih cepet build)
-    ShootRate   = 0.25,    -- Detik antar shoot
-    ReachDist   = 4,       -- Jarak anggap "udah nyampe" tujuan (studs)
-    SearchDepth = 6,       -- Kedalaman rekursi workspace scan
+-- ── Config ────────────────────────────────────────────────────────────────────
+local Cfg = {
+    AutoPlay    = false,
+    AutoShoot   = false,
+    AutoBuy     = true,     -- Otomatis beli blok kalau hampir habis
+    WalkSpeed   = 20,
+    PlaceRate   = 0.15,     -- Jeda antar place (detik)
+    ShootRate   = 0.25,
+    BuyRate     = 1.0,      -- Jeda antar auto-buy
+    ReachDist   = 3.5,
+    PlaceOffset = 5,        -- Jarak ke depan tempat blok ditaruh (studs)
+    MinBlocks   = 10,       -- Beli lagi kalau blok < nilai ini
 }
 
 -- ── State ─────────────────────────────────────────────────────────────────────
-local State = {
-    lastPlace = 0,
-    lastShoot = 0,
-    moveTarget = nil,   -- Vector3 tujuan MoveTo saat ini
+local St = {
+    lastPlace   = 0,
+    lastShoot   = 0,
+    lastBuy     = 0,
+    moveTarget  = nil,
+    bridgeDir   = nil,      -- Vector3 arah bridge (ke musuh), dihitung 1x
 }
 
--- ── Helpers ───────────────────────────────────────────────────────────────────
+-- ── Char helpers ──────────────────────────────────────────────────────────────
 local function getChar()
-    local c = LocalPlayer.Character
+    local c = LP.Character
     if not c then return nil, nil, nil end
     return c, c:FindFirstChild("Humanoid"), c:FindFirstChild("HumanoidRootPart")
 end
 
 local function getTool()
-    local c = LocalPlayer.Character
+    local c = LP.Character
     return c and c:FindFirstChildOfClass("Tool")
 end
 
--- Deep scan workspace dengan batasan kedalaman — cegah stack overflow
-local function scanDescendants(root, depth, results)
-    if depth <= 0 then return end
-    for _, obj in ipairs(root:GetChildren()) do
-        if obj:IsA("BasePart") then
-            results[#results + 1] = obj
-        end
-        -- Masuk ke Model/Folder, tapi skip character player lain
-        if (obj:IsA("Model") or obj:IsA("Folder")) and not Players:GetPlayerFromCharacter(obj) then
-            scanDescendants(obj, depth - 1, results)
-        end
-    end
-end
+-- ── Hitung arah bridge sekali saat spawn ─────────────────────────────────────
+-- Bridge Battles: dua tim spawn di ujung berlawanan sumbu Z (atau X).
+-- Kita deteksi dengan cari spawn point tim lawan = arah yg harus dituju.
+local function detectBridgeDir(hrp)
+    -- Coba cari SpawnLocation lawan
+    local myTeam = LP.Team
+    local bestDir = nil
+    local bestDist = 0
 
--- Cari blok tim terdekat (warna ATAU nama tim)
-local function getNearestTeamBlock()
-    local _, _, hrp = getChar()
-    if not hrp or not LocalPlayer.Team then return nil end
-
-    local teamColor = LocalPlayer.TeamColor.Color
-    local teamName  = string.lower(LocalPlayer.Team.Name)
-
-    local parts = {}
-    scanDescendants(Workspace, Config.SearchDepth, parts)
-
-    local nearest, shortest = nil, 120
-    for _, obj in ipairs(parts) do
-        local nameLow = string.lower(obj.Name)
-        local isTeamColored = (obj.Color == teamColor)
-        local isTeamNamed   = string.find(nameLow, teamName, 1, true)
-        local isBlockPart   = string.find(nameLow, "block", 1, true)
-                           or string.find(nameLow, "stud",  1, true)
-                           or string.find(nameLow, "brick", 1, true)
-
-        if (isTeamColored or isTeamNamed) and isBlockPart then
-            local dist = (obj.Position - hrp.Position).Magnitude
-            if dist < shortest then
-                shortest = dist
-                nearest  = obj
+    for _, spawn in ipairs(Workspace:GetDescendants()) do
+        if spawn:IsA("SpawnLocation") and spawn.TeamColor ~= LP.TeamColor then
+            local dir = (spawn.Position - hrp.Position)
+            if dir.Magnitude > bestDist then
+                bestDist = dir.Magnitude
+                bestDir  = dir.Unit
             end
         end
     end
-    return nearest
+
+    -- Fallback: kalau ngga ketemu, cek bridge model — ambil ujung terjauh
+    if not bestDir then
+        local farthest = hrp.Position
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("BasePart") and (
+                string.find(string.lower(obj.Name), "bridge", 1, true) or
+                string.find(string.lower(obj.Name), "plank", 1, true) or
+                string.find(string.lower(obj.Name), "tile",  1, true)
+            ) then
+                if (obj.Position - hrp.Position).Magnitude > (farthest - hrp.Position).Magnitude then
+                    farthest = obj.Position
+                end
+            end
+        end
+        if (farthest - hrp.Position).Magnitude > 10 then
+            local d = (farthest - hrp.Position)
+            bestDir = Vector3.new(d.X, 0, d.Z).Unit
+        end
+    end
+
+    -- Fallback akhir: lihat arah kamera saat spawn
+    if not bestDir then
+        bestDir = Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z).Unit
+    end
+
+    St.bridgeDir = bestDir
+    print("[BridgeBot] Bridge direction detected: " .. tostring(bestDir))
 end
 
--- Safe MoveTo: hanya kirim perintah baru kalau target berubah / belum nyampe
-local function moveTo(hum, hrp, target)
-    if not (hum and hrp and target) then return end
-    local dist = (hrp.Position - target).Magnitude
-    if dist <= Config.ReachDist then
-        State.moveTarget = nil
-        return true -- udah nyampe
+-- ── Baca jumlah blok dari GUI game (leaderstats / GUI label) ─────────────────
+local function getBlockCount()
+    -- Coba dari leaderstats
+    local ls = LP:FindFirstChild("leaderstats")
+    if ls then
+        local b = ls:FindFirstChild("Blocks") or ls:FindFirstChild("Block")
+        if b then return tonumber(b.Value) or 999 end
     end
-    -- Kirim MoveTo baru hanya kalau target beda dari yg terakhir
-    if State.moveTarget == nil or (State.moveTarget - target).Magnitude > 1 then
-        State.moveTarget = target
-        hum:MoveTo(target)
+    -- Coba dari PlayerGui label
+    local pg = LP:FindFirstChild("PlayerGui")
+    if pg then
+        for _, d in ipairs(pg:GetDescendants()) do
+            if d:IsA("TextLabel") and string.find(d.Text, "Block", 1, true) then
+                local n = tonumber(d.Text:match("%d+"))
+                if n then return n end
+            end
+        end
+    end
+    return 999 -- anggap cukup kalau ngga bisa dibaca
+end
+
+-- ── Auto-buy blok (klik tombol +100 di GUI game) ─────────────────────────────
+local function autoBuy()
+    local now = tick()
+    if now - St.lastBuy < Cfg.BuyRate then return end
+    if getBlockCount() >= Cfg.MinBlocks then return end
+
+    -- Cari tombol beli di PlayerGui (biasanya TextButton "+100" atau sejenisnya)
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+
+    local bestBtn = nil
+    local bestVal = 0
+    for _, d in ipairs(pg:GetDescendants()) do
+        if d:IsA("TextButton") and d.Visible then
+            -- Cari tombol yang mengandung "+" dan angka
+            local val = tonumber(d.Text:match("%+?(%d+)"))
+            if val and val > bestVal and val <= 100 then
+                bestVal = val
+                bestBtn = d
+            end
+        end
+    end
+
+    if bestBtn then
+        -- Simulasi klik tombol UI
+        pcall(function()
+            local mpos = bestBtn.AbsolutePosition + bestBtn.AbsoluteSize / 2
+            VirtualUser:ClickButton2d(mpos)
+        end)
+        -- Fallback: fire MouseButton1Click
+        pcall(function() bestBtn:activate() end)
+        St.lastBuy = now
+    end
+end
+
+-- ── Place block: VirtualUser click ke titik di depan karakter ────────────────
+-- Ini jauh lebih reliable dari tool:Activate() karena ada target posisi nyata.
+local function doPlace(hrp)
+    local now = tick()
+    if now - St.lastPlace < Cfg.PlaceRate then return end
+
+    local dir = St.bridgeDir or (hrp and hrp.CFrame.LookVector) or Vector3.new(0,0,-1)
+    dir = Vector3.new(dir.X, 0, dir.Z).Unit
+
+    -- Target di depan karakter, sedikit ke bawah (level lantai bridge)
+    local target3D = hrp.Position + dir * Cfg.PlaceOffset + Vector3.new(0, -2.5, 0)
+
+    -- Project ke screen position
+    local screenPos, onScreen = Camera:WorldToScreenPoint(target3D)
+
+    if onScreen then
+        pcall(function()
+            VirtualUser:Button1Down(Vector2.new(screenPos.X, screenPos.Y), CFrame.new())
+            task.delay(0.05, function()
+                VirtualUser:Button1Up(Vector2.new(screenPos.X, screenPos.Y), CFrame.new())
+            end)
+        end)
+    else
+        -- Fallback kalau off-screen
+        pcall(function()
+            local tool = getTool()
+            if tool then tool:Activate() end
+        end)
+    end
+
+    St.lastPlace = now
+end
+
+-- ── Auto-shoot: sama pakai VirtualUser ───────────────────────────────────────
+local function doShoot(hrp)
+    local now = tick()
+    if now - St.lastShoot < Cfg.ShootRate then return end
+
+    -- Tembak ke arah musuh terdekat
+    local nearest, nearDist = nil, 60
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LP and p.Team ~= LP.Team then
+            local pc = p.Character
+            local phrp = pc and pc:FindFirstChild("HumanoidRootPart")
+            if phrp then
+                local d = (phrp.Position - hrp.Position).Magnitude
+                if d < nearDist then nearDist = d; nearest = phrp end
+            end
+        end
+    end
+
+    local targetPos = nearest and nearest.Position or (hrp.Position + hrp.CFrame.LookVector * 20)
+    local screenPos, onScreen = Camera:WorldToScreenPoint(targetPos)
+
+    if onScreen then
+        pcall(function()
+            VirtualUser:Button1Down(Vector2.new(screenPos.X, screenPos.Y), CFrame.new())
+            task.delay(0.05, function()
+                VirtualUser:Button1Up(Vector2.new(screenPos.X, screenPos.Y), CFrame.new())
+            end)
+        end)
+    else
+        pcall(function()
+            local tool = getTool()
+            if tool then tool:Activate() end
+        end)
+    end
+
+    St.lastShoot = now
+end
+
+-- ── Safe MoveTo dengan goal check ────────────────────────────────────────────
+local function moveTo(hum, hrp, target)
+    if not (hum and hrp and target) then return false end
+    local flat = Vector3.new(target.X, hrp.Position.Y, target.Z)
+    if (hrp.Position - flat).Magnitude <= Cfg.ReachDist then
+        St.moveTarget = nil
+        return true
+    end
+    if St.moveTarget == nil or (St.moveTarget - flat).Magnitude > 1.5 then
+        St.moveTarget = flat
+        hum:MoveTo(flat)
     end
     return false
 end
 
--- Place throttled
-local function doPlace()
-    local now = tick()
-    if now - State.lastPlace < Config.PlaceRate then return end
-    local tool = getTool()
-    if tool then
-        pcall(function() tool:Activate() end)
-        State.lastPlace = now
-    end
-end
-
--- Shoot throttled
-local function doShoot()
-    local now = tick()
-    if now - State.lastShoot < Config.ShootRate then return end
-    local tool = getTool()
-    if tool then
-        pcall(function() tool:Activate() end)
-        State.lastShoot = now
-    end
-end
-
--- ── Loop Utama (Heartbeat-safe: TANPA task.wait di dalam) ─────────────────────
+-- ── Loop Utama ────────────────────────────────────────────────────────────────
 local conn = RunService.Heartbeat:Connect(function()
     local char, hum, hrp = getChar()
     if not (char and hum and hrp) then return end
 
-    -- Jaga WalkSpeed
-    if hum.WalkSpeed ~= Config.WalkSpeed then
-        hum.WalkSpeed = Config.WalkSpeed
+    -- WalkSpeed
+    if hum.WalkSpeed ~= Cfg.WalkSpeed then hum.WalkSpeed = Cfg.WalkSpeed end
+
+    -- Deteksi arah bridge sekali
+    if not St.bridgeDir then
+        detectBridgeDir(hrp)
     end
 
-    -- AUTO SHOOT
-    if Config.AutoShoot then
-        doShoot()
+    -- Auto-buy
+    if Cfg.AutoBuy and Cfg.AutoPlay then
+        autoBuy()
     end
 
-    -- AUTO PLAY
-    if Config.AutoPlay then
-        local tool = getTool()
+    -- Auto Shoot
+    if Cfg.AutoShoot then
+        doShoot(hrp)
+    end
 
-        if tool then
-            -- Punya blok → jalan lurus ke depan sambil place
-            local forwardTarget = hrp.Position + hrp.CFrame.LookVector * 12
-            -- Matikan Y drift biar ngga jatuh kalau ada slope kecil
-            forwardTarget = Vector3.new(forwardTarget.X, hrp.Position.Y, forwardTarget.Z)
-            moveTo(hum, hrp, forwardTarget)
-            doPlace()
-        else
-            -- Tangan kosong → cari blok tim
-            local block = getNearestTeamBlock()
-            if block then
-                local arrived = moveTo(hum, hrp, block.Position)
-                -- Kalau udah sampai tapi blok masih ada, tap buat ambil
-                if arrived then
-                    pcall(function()
-                        -- Simulasi touch/interact — beberapa game pake ProximityPrompt
-                        local pp = block:FindFirstChildOfClass("ProximityPrompt")
-                        if pp then
-                            fireproximityprompt(pp)  -- executor global func
-                        end
-                    end)
-                end
-            else
-                -- Blok ngga ketemu → wander pelan ke titik random deket spawn
-                local wander = hrp.Position + Vector3.new(
-                    math.random(-8, 8), 0, math.random(-8, 8)
-                )
-                moveTo(hum, hrp, wander)
-            end
-        end
+    -- Auto Play: jalan ke ujung bridge sambil place
+    if Cfg.AutoPlay then
+        local dir = St.bridgeDir or Vector3.new(hrp.CFrame.LookVector.X, 0, hrp.CFrame.LookVector.Z).Unit
+        -- Target: terus maju 20 stud ke arah bridge
+        local target = hrp.Position + dir * 20
+        target = Vector3.new(target.X, hrp.Position.Y, target.Z)
+        moveTo(hum, hrp, target)
+        doPlace(hrp)
     end
 end)
 
@@ -193,113 +291,100 @@ _G.BridgeBotConnections[#_G.BridgeBotConnections + 1] = conn
 
 -- ── GUI ───────────────────────────────────────────────────────────────────────
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name          = "BridgeBotGUI"
-ScreenGui.ResetOnSpawn  = false
-ScreenGui.Parent        = LocalPlayer:WaitForChild("PlayerGui")
+ScreenGui.Name         = "BridgeBotGUI"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.Parent       = LP:WaitForChild("PlayerGui")
 
-local MainFrame = Instance.new("Frame", ScreenGui)
-MainFrame.Size              = UDim2.new(0, 210, 0, 200)
-MainFrame.Position          = UDim2.new(0, 16, 0.5, -100)
-MainFrame.BackgroundColor3  = Color3.fromRGB(15, 15, 15)
-MainFrame.BorderSizePixel   = 0
-MainFrame.Active            = true
-MainFrame.Draggable         = true
-Instance.new("UICorner", MainFrame).CornerRadius = UDim.new(0, 10)
+local Frame = Instance.new("Frame", ScreenGui)
+Frame.Size             = UDim2.new(0, 215, 0, 240)
+Frame.Position         = UDim2.new(0, 14, 0.5, -120)
+Frame.BackgroundColor3 = Color3.fromRGB(14, 14, 14)
+Frame.BorderSizePixel  = 0
+Frame.Active           = true
+Frame.Draggable        = true
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 10)
 
--- Title bar
-local TitleBar = Instance.new("Frame", MainFrame)
-TitleBar.Size             = UDim2.new(1, 0, 0, 38)
-TitleBar.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
-TitleBar.BorderSizePixel  = 0
-Instance.new("UICorner", TitleBar).CornerRadius = UDim.new(0, 10)
+local TBar = Instance.new("Frame", Frame)
+TBar.Size             = UDim2.new(1, 0, 0, 36)
+TBar.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+TBar.BorderSizePixel  = 0
+Instance.new("UICorner", TBar).CornerRadius = UDim.new(0, 10)
 
-local Title = Instance.new("TextLabel", TitleBar)
-Title.Size                = UDim2.new(1, 0, 1, 0)
-Title.BackgroundTransparency = 1
-Title.Text                = "🌉 Bridge Bot v2"
-Title.TextColor3          = Color3.fromRGB(240, 240, 240)
-Title.Font                = Enum.Font.GothamBold
-Title.TextSize            = 15
+local TLabel = Instance.new("TextLabel", TBar)
+TLabel.Size               = UDim2.new(1, 0, 1, 0)
+TLabel.BackgroundTransparency = 1
+TLabel.Text               = "🌉 Bridge Bot v3"
+TLabel.TextColor3         = Color3.fromRGB(235, 235, 235)
+TLabel.Font               = Enum.Font.GothamBold
+TLabel.TextSize           = 15
 
--- Toggle factory
-local function createToggle(parent, labelText, configKey, yPos)
-    local Btn = Instance.new("TextButton", parent)
-    Btn.Size             = UDim2.new(0.88, 0, 0, 38)
-    Btn.Position         = UDim2.new(0.06, 0, 0, yPos)
-    Btn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-    Btn.TextColor3       = Color3.fromRGB(220, 220, 220)
+local function makeToggle(label, key, y)
+    local Btn = Instance.new("TextButton", Frame)
+    Btn.Size             = UDim2.new(0.88, 0, 0, 36)
+    Btn.Position         = UDim2.new(0.06, 0, 0, y)
+    Btn.BackgroundColor3 = Color3.fromRGB(38, 38, 38)
+    Btn.TextColor3       = Color3.fromRGB(210, 210, 210)
     Btn.Font             = Enum.Font.GothamBold
     Btn.TextSize         = 13
-    Btn.Text             = labelText .. "  ●  OFF"
+    Btn.Text             = label .. "  ●  OFF"
     Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 6)
-
     Btn.MouseButton1Click:Connect(function()
-        Config[configKey] = not Config[configKey]
-        local on = Config[configKey]
-        Btn.Text             = labelText .. "  ●  " .. (on and "ON" or "OFF")
-        Btn.BackgroundColor3 = on and Color3.fromRGB(20, 140, 60) or Color3.fromRGB(40, 40, 40)
-    end)
-    return Btn
-end
-
-createToggle(MainFrame, "Auto Play (Team)", "AutoPlay",  46)
-createToggle(MainFrame, "Auto Shoot",       "AutoShoot", 92)
-
--- Speed slider label (read-only display)
-local SpeedLabel = Instance.new("TextLabel", MainFrame)
-SpeedLabel.Size                 = UDim2.new(0.88, 0, 0, 24)
-SpeedLabel.Position             = UDim2.new(0.06, 0, 0, 138)
-SpeedLabel.BackgroundTransparency = 1
-SpeedLabel.Text                 = "Speed: " .. Config.WalkSpeed
-SpeedLabel.TextColor3           = Color3.fromRGB(160, 160, 160)
-SpeedLabel.Font                 = Enum.Font.Gotham
-SpeedLabel.TextSize             = 12
-SpeedLabel.TextXAlignment       = Enum.TextXAlignment.Left
-
--- Speed +/- buttons
-local function makeSpeedBtn(label, xOffset, delta)
-    local Btn = Instance.new("TextButton", MainFrame)
-    Btn.Size             = UDim2.new(0, 36, 0, 24)
-    Btn.Position         = UDim2.new(0, xOffset, 0, 162)
-    Btn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-    Btn.TextColor3       = Color3.fromRGB(255, 255, 255)
-    Btn.Font             = Enum.Font.GothamBold
-    Btn.TextSize         = 14
-    Btn.Text             = label
-    Instance.new("UICorner", Btn).CornerRadius = UDim.new(0, 5)
-    Btn.MouseButton1Click:Connect(function()
-        Config.WalkSpeed = math.clamp(Config.WalkSpeed + delta, 8, 40)
-        SpeedLabel.Text  = "Speed: " .. Config.WalkSpeed
+        Cfg[key] = not Cfg[key]
+        local on = Cfg[key]
+        Btn.Text             = label .. "  ●  " .. (on and "ON" or "OFF")
+        Btn.BackgroundColor3 = on and Color3.fromRGB(20, 135, 55) or Color3.fromRGB(38, 38, 38)
+        -- Reset bridge dir tiap kali AutoPlay diaktifkan
+        if key == "AutoPlay" and on then St.bridgeDir = nil end
     end)
 end
-makeSpeedBtn("-", 14, -2)
-makeSpeedBtn("+", 56, 2)
 
--- Status bar
-local Status = Instance.new("TextLabel", MainFrame)
-Status.Size                 = UDim2.new(1, 0, 0, 22)
-Status.Position             = UDim2.new(0, 0, 1, -24)
-Status.BackgroundTransparency = 1
-Status.Text                 = "Auto Detects Team Color"
-Status.TextColor3           = Color3.fromRGB(80, 200, 120)
-Status.Font                 = Enum.Font.Gotham
-Status.TextSize             = 11
+makeToggle("Auto Play",  "AutoPlay",  44)
+makeToggle("Auto Shoot", "AutoShoot", 88)
+makeToggle("Auto Buy",   "AutoBuy",  132)
 
--- Live team-color dot
-local dot = Instance.new("Frame", MainFrame)
-dot.Size             = UDim2.new(0, 10, 0, 10)
-dot.Position         = UDim2.new(1, -18, 1, -19)
-dot.BorderSizePixel  = 0
-Instance.new("UICorner", dot).CornerRadius = UDim.new(1, 0)
+-- Speed display + buttons
+local SpLbl = Instance.new("TextLabel", Frame)
+SpLbl.Size               = UDim2.new(0.88, 0, 0, 20)
+SpLbl.Position           = UDim2.new(0.06, 0, 0, 176)
+SpLbl.BackgroundTransparency = 1
+SpLbl.Text               = "WalkSpeed: " .. Cfg.WalkSpeed
+SpLbl.TextColor3         = Color3.fromRGB(150, 150, 150)
+SpLbl.Font               = Enum.Font.Gotham
+SpLbl.TextSize           = 12
+SpLbl.TextXAlignment     = Enum.TextXAlignment.Left
 
-local dotConn = RunService.Heartbeat:Connect(function()
-    if LocalPlayer.Team then
-        dot.BackgroundColor3 = LocalPlayer.TeamColor.Color
-    else
-        dot.BackgroundColor3 = Color3.fromRGB(80, 80, 80)
-    end
+local function spBtn(lbl, xOff, delta)
+    local b = Instance.new("TextButton", Frame)
+    b.Size             = UDim2.new(0, 34, 0, 22)
+    b.Position         = UDim2.new(0, xOff, 0, 198)
+    b.BackgroundColor3 = Color3.fromRGB(48, 48, 48)
+    b.TextColor3       = Color3.fromRGB(255,255,255)
+    b.Font             = Enum.Font.GothamBold
+    b.TextSize         = 14
+    b.Text             = lbl
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+    b.MouseButton1Click:Connect(function()
+        Cfg.WalkSpeed = math.clamp(Cfg.WalkSpeed + delta, 8, 40)
+        SpLbl.Text    = "WalkSpeed: " .. Cfg.WalkSpeed
+    end)
+end
+spBtn("-", 14, -2)
+spBtn("+", 54, 2)
+
+-- Block count live
+local BlkLbl = Instance.new("TextLabel", Frame)
+BlkLbl.Size               = UDim2.new(1, 0, 0, 20)
+BlkLbl.Position           = UDim2.new(0, 0, 1, -22)
+BlkLbl.BackgroundTransparency = 1
+BlkLbl.TextColor3         = Color3.fromRGB(80, 195, 120)
+BlkLbl.Font               = Enum.Font.Gotham
+BlkLbl.TextSize           = 11
+
+local blkConn = RunService.Heartbeat:Connect(function()
+    local cnt = getBlockCount()
+    BlkLbl.Text = cnt >= 999 and "Blocks: --" or ("Blocks: " .. cnt)
 end)
-_G.BridgeBotConnections[#_G.BridgeBotConnections + 1] = dotConn
+_G.BridgeBotConnections[#_G.BridgeBotConnections + 1] = blkConn
 
 _G.BridgeBotLoaded = ScreenGui
-print("[BridgeBot v2] Loaded — Team auto-detected, connections tracked.")
+print("[BridgeBot v3] Loaded — VirtualUser place, bridge-dir detection, auto-buy")
